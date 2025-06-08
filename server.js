@@ -21,7 +21,6 @@ app.use(
 app.use(morgan("combined"));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-app.options("*", cors());
 
 // In-memory storage
 const parkingData = new Map(); // deviceId -> current parking data
