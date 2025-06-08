@@ -2,22 +2,34 @@ const express = require("express");
 const cors = require("cors");
 const morgan = require("morgan");
 const helmet = require("helmet");
+const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
 require("dotenv").config();
 
 const app = express();
 
-// Middleware
 app.use(helmet());
 app.use(cors());
 app.use(morgan("combined"));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// In-memory storage
-const parkingData = new Map(); // deviceId -> current parking data
-const slotHistory = []; // Array to store slot change history
+const parkingData = new Map(); 
+const slotHistory = []; 
+const adminUsers = new Map(); 
 
-// Helper functions
+const defaultAdmin = {
+  username: "admin",
+  password: bcrypt.hashSync("admin123", 10), 
+  email: "admin@parkingsystem.com",
+  role: "admin",
+  createdAt: new Date(),
+};
+adminUsers.set("admin", defaultAdmin);
+
+const JWT_SECRET =
+  process.env.JWT_SECRET || "your-super-secret-key-change-this";
+
 function getClientIP(req) {
   return (
     req.headers["x-forwarded-for"] ||
@@ -27,18 +39,15 @@ function getClientIP(req) {
   );
 }
 
-// Helper function to convert UTC to WIB (UTC+7)
 function convertToWIB(date) {
   const wibDate = new Date(date.getTime() + 7 * 60 * 60 * 1000);
   return wibDate;
 }
 
-// Helper function to get current time in WIB
 function getCurrentWIBTime() {
   return convertToWIB(new Date());
 }
 
-// Helper function to format date in WIB
 function formatWIBDate(date) {
   const wibDate = convertToWIB(date);
   return {
@@ -64,9 +73,39 @@ function formatWIBDate(date) {
       minute: "2-digit",
       second: "2-digit",
     }),
-    hour: wibDate.getUTCHours(),
     timestamp: wibDate.getTime(),
   };
+}
+
+function authenticateAdmin(req, res, next) {
+  const token = req.header("Authorization")?.replace("Bearer ", "");
+
+  if (!token) {
+    return res.status(401).json({
+      success: false,
+      error: "Access denied. No token provided.",
+    });
+  }
+
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const user = adminUsers.get(decoded.username);
+
+    if (!user || user.role !== "admin") {
+      return res.status(401).json({
+        success: false,
+        error: "Access denied. Invalid token.",
+      });
+    }
+
+    req.user = decoded;
+    next();
+  } catch (error) {
+    res.status(401).json({
+      success: false,
+      error: "Invalid token.",
+    });
+  }
 }
 
 function logSlotChange(
@@ -80,17 +119,15 @@ function logSlotChange(
   const log = {
     deviceId,
     slotId,
-    previousState, // true = occupied, false = available
+    previousState,
     newState,
-    timestamp: new Date(), // Store original UTC time
-    timestampWIB: currentTime, // Store WIB time
+    timestamp: new Date(), 
+    timestampWIB: currentTime, 
     ipAddress,
-    duration: null, // will be calculated when slot becomes available
+    duration: null, 
   };
 
-  // If slot becomes available, calculate how long it was occupied
   if (previousState === true && newState === false) {
-    // Find the last time this slot was occupied
     const lastOccupied = slotHistory
       .slice()
       .reverse()
@@ -113,13 +150,116 @@ function logSlotChange(
     } -> ${newState ? "occupied" : "available"}`
   );
 
-  // Keep only last 10000 logs to prevent memory overflow
-  if (slotHistory.length > 10000) {
+  if (slotHistory.length > 5000) {
     slotHistory.shift();
   }
 }
 
-// Health Check
+app.post("/api/auth/register", async (req, res) => {
+  try {
+    const { username, password, email } = req.body;
+
+    if (!username || !password || !email) {
+      return res.status(400).json({
+        success: false,
+        error: "Username, password, and email are required",
+      });
+    }
+
+    if (adminUsers.has(username)) {
+      return res.status(400).json({
+        success: false,
+        error: "Username already exists",
+      });
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    const newUser = {
+      username,
+      password: hashedPassword,
+      email,
+      role: "admin",
+      createdAt: new Date(),
+    };
+
+    adminUsers.set(username, newUser);
+
+    res.json({
+      success: true,
+      message: "Admin registered successfully",
+      data: {
+        username,
+        email,
+        role: "admin",
+      },
+    });
+  } catch (error) {
+    console.error("Registration error:", error);
+    res.status(500).json({
+      success: false,
+      error: "Registration failed",
+    });
+  }
+});
+
+app.post("/api/auth/login", async (req, res) => {
+  try {
+    const { username, password } = req.body;
+
+    if (!username || !password) {
+      return res.status(400).json({
+        success: false,
+        error: "Username and password are required",
+      });
+    }
+
+    const user = adminUsers.get(username);
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        error: "Invalid credentials",
+      });
+    }
+
+    const isValidPassword = await bcrypt.compare(password, user.password);
+    if (!isValidPassword) {
+      return res.status(401).json({
+        success: false,
+        error: "Invalid credentials",
+      });
+    }
+
+    const token = jwt.sign(
+      {
+        username: user.username,
+        role: user.role,
+      },
+      JWT_SECRET,
+      { expiresIn: "24h" }
+    );
+
+    res.json({
+      success: true,
+      message: "Login successful",
+      data: {
+        token,
+        user: {
+          username: user.username,
+          email: user.email,
+          role: user.role,
+        },
+      },
+    });
+  } catch (error) {
+    console.error("Login error:", error);
+    res.status(500).json({
+      success: false,
+      error: "Login failed",
+    });
+  }
+});
+
 app.get("/api/health", (req, res) => {
   const wibTime = formatWIBDate(new Date());
   res.json({
@@ -131,7 +271,6 @@ app.get("/api/health", (req, res) => {
   });
 });
 
-// Parking Status Update from Arduino
 app.post("/api/parking-status", (req, res) => {
   const { deviceId, timestamp, wifiStatus, slots } = req.body;
 
@@ -146,7 +285,6 @@ app.post("/api/parking-status", (req, res) => {
   if (slots && Array.isArray(slots)) {
     totalSlots = slots.length;
 
-    // Get previous slot states for comparison
     const previousData = parkingData.get(deviceId);
     const previousSlots = previousData ? previousData.slots : [];
 
@@ -160,7 +298,6 @@ app.post("/api/parking-status", (req, res) => {
             lastUpdate: slot.lastUpdate || Date.now(),
           };
 
-          // Check if slot state changed
           const previousSlot = previousSlots.find((p) => p.id === slotData.id);
           if (previousSlot && previousSlot.occupied !== slotData.occupied) {
             logSlotChange(
@@ -175,7 +312,6 @@ app.post("/api/parking-status", (req, res) => {
           return slotData;
         });
       } else {
-        // Handle simple array format [0, 1, 0, 1] where 0 = available, 1 = occupied
         availableSlots = slots.filter((slot) => slot === 0).length;
         processedSlots = slots.map((occupied, index) => {
           const slotData = {
@@ -184,7 +320,6 @@ app.post("/api/parking-status", (req, res) => {
             lastUpdate: Date.now(),
           };
 
-          // Check if slot state changed
           const previousSlot = previousSlots.find((p) => p.id === slotData.id);
           if (previousSlot && previousSlot.occupied !== slotData.occupied) {
             logSlotChange(
@@ -204,7 +339,6 @@ app.post("/api/parking-status", (req, res) => {
 
   const currentTime = getCurrentWIBTime();
 
-  // Store parking data in memory
   parkingData.set(deviceId, {
     deviceId,
     timestamp,
@@ -234,13 +368,11 @@ app.post("/api/parking-status", (req, res) => {
   });
 });
 
-// Get Parking Status
 app.get("/api/parking-status", (req, res) => {
   const { deviceId } = req.query;
 
   try {
     if (deviceId) {
-      // Get specific device status
       if (parkingData.has(deviceId)) {
         const deviceData = parkingData.get(deviceId);
         const wibTime = formatWIBDate(new Date());
@@ -248,8 +380,25 @@ app.get("/api/parking-status", (req, res) => {
         res.json({
           success: true,
           data: {
-            ...deviceData,
+            deviceId: deviceData.deviceId,
+            availableSlots: deviceData.availableSlots,
+            totalSlots: deviceData.totalSlots,
+            occupancyRate:
+              deviceData.totalSlots > 0
+                ? (
+                    ((deviceData.totalSlots - deviceData.availableSlots) /
+                      deviceData.totalSlots) *
+                    100
+                  ).toFixed(1)
+                : 0,
+            lastUpdate: deviceData.lastUpdate,
             lastUpdateWIB: formatWIBDate(deviceData.lastUpdate),
+            wifiStatus: deviceData.wifiStatus,
+            slots: deviceData.slots.map((slot) => ({
+              id: slot.id,
+              occupied: slot.occupied,
+              lastUpdate: new Date(slot.lastUpdate),
+            })),
           },
           timestamp: new Date().toISOString(),
           timestampWIB: wibTime,
@@ -262,10 +411,25 @@ app.get("/api/parking-status", (req, res) => {
         });
       }
     } else {
-      // Get all devices status
       const allStatus = Array.from(parkingData.values()).map((device) => ({
-        ...device,
+        deviceId: device.deviceId,
+        totalSlots: device.totalSlots,
+        availableSlots: device.availableSlots,
+        occupancyRate:
+          device.totalSlots > 0
+            ? (
+                ((device.totalSlots - device.availableSlots) /
+                  device.totalSlots) *
+                100
+              ).toFixed(1)
+            : 0,
+        lastUpdate: device.lastUpdate,
         lastUpdateWIB: formatWIBDate(device.lastUpdate),
+        wifiStatus: device.wifiStatus,
+        slots: device.slots.map((slot) => ({
+          id: slot.id,
+          occupied: slot.occupied,
+        })),
       }));
 
       const wibTime = formatWIBDate(new Date());
@@ -286,17 +450,11 @@ app.get("/api/parking-status", (req, res) => {
   }
 });
 
-// Admin Dashboard - Single endpoint with comprehensive parking analytics
-app.get("/api/admin/dashboard", (req, res) => {
+app.get("/api/admin/dashboard", authenticateAdmin, (req, res) => {
   try {
     const now = new Date();
-    const nowWIB = getCurrentWIBTime();
-
-    // Calculate time ranges in WIB
     const last24Hours = new Date(now.getTime() - 24 * 60 * 60 * 1000);
-    const last7Days = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
 
-    // Current parking status summary
     const currentStatus = Array.from(parkingData.values()).map((data) => ({
       deviceId: data.deviceId,
       totalSlots: data.totalSlots,
@@ -312,219 +470,46 @@ app.get("/api/admin/dashboard", (req, res) => {
       lastUpdate: data.lastUpdate,
       lastUpdateWIB: formatWIBDate(data.lastUpdate),
       wifiStatus: data.wifiStatus,
-      slots: data.slots.map((slot) => ({
-        id: slot.id,
-        occupied: slot.occupied,
-        lastUpdate: new Date(slot.lastUpdate),
-        lastUpdateWIB: formatWIBDate(new Date(slot.lastUpdate)),
-      })),
     }));
 
-    // Slot usage analytics - which slots are most frequently occupied
-    const slotUsageStats = {};
-
-    // Initialize slot stats for each device
-    currentStatus.forEach((device) => {
-      if (!slotUsageStats[device.deviceId]) {
-        slotUsageStats[device.deviceId] = {};
-      }
-
-      device.slots.forEach((slot) => {
-        if (!slotUsageStats[device.deviceId][slot.id]) {
-          slotUsageStats[device.deviceId][slot.id] = {
-            slotId: slot.id,
-            totalOccupations: 0,
-            totalDuration: 0,
-            averageDuration: 0,
-            currentlyOccupied: slot.occupied,
-            last24hOccupations: 0,
-            last7dOccupations: 0,
-          };
-        }
-      });
-    });
-
-    // Analyze historical data
-    slotHistory.forEach((log) => {
-      if (!slotUsageStats[log.deviceId]) return;
-      if (!slotUsageStats[log.deviceId][log.slotId]) return;
-
-      const slotStats = slotUsageStats[log.deviceId][log.slotId];
-
-      // Count occupations (when slot becomes occupied)
-      if (log.newState === true) {
-        slotStats.totalOccupations++;
-
-        // Count recent occupations
-        if (log.timestamp >= last24Hours) {
-          slotStats.last24hOccupations++;
-        }
-        if (log.timestamp >= last7Days) {
-          slotStats.last7dOccupations++;
-        }
-      }
-
-      // Add duration when slot becomes available
-      if (log.newState === false && log.duration) {
-        slotStats.totalDuration += log.duration;
-      }
-    });
-
-    // Calculate average durations
-    Object.keys(slotUsageStats).forEach((deviceId) => {
-      Object.keys(slotUsageStats[deviceId]).forEach((slotId) => {
-        const stats = slotUsageStats[deviceId][slotId];
-        if (stats.totalOccupations > 0) {
-          stats.averageDuration = Math.round(
-            stats.totalDuration / stats.totalOccupations
-          );
-        }
-      });
-    });
-
-    // Recent slot changes (last 50 changes) with WIB timestamps
     const recentChanges = slotHistory
-      .slice(-50)
+      .slice(-20)
       .reverse()
       .map((log) => ({
         deviceId: log.deviceId,
         slotId: log.slotId,
         change: log.newState ? "occupied" : "available",
-        previousState: log.previousState ? "occupied" : "available",
         timestamp: log.timestamp,
         timestampWIB: formatWIBDate(log.timestamp),
         duration: log.duration ? Math.round(log.duration / 1000 / 60) : null, // in minutes
       }));
 
-    // Enhanced Hourly occupancy pattern (last 24 hours) in WIB
-    const hourlyPattern = {};
+    const totalSlots = currentStatus.reduce(
+      (sum, device) => sum + device.totalSlots,
+      0
+    );
+    const totalOccupied = currentStatus.reduce(
+      (sum, device) => sum + device.occupiedSlots,
+      0
+    );
 
-    // Initialize 24 hours pattern with WIB times
-    for (let i = 0; i < 24; i++) {
-      const hourTime = new Date(nowWIB.getTime() - i * 60 * 60 * 1000);
-      const wibHour = hourTime.getUTCHours(); // Since we already converted to WIB
-
-      hourlyPattern[wibHour] = {
-        hour: wibHour,
-        hourFormatted: `${wibHour.toString().padStart(2, "0")}:00`,
-        occupations: 0,
-        releases: 0,
-        netChange: 0,
-        date: formatWIBDate(hourTime).date,
-      };
-    }
-
-    // Analyze slot history for hourly patterns using WIB time
-    slotHistory
-      .filter((log) => log.timestamp >= last24Hours)
-      .forEach((log) => {
-        const logWIB = convertToWIB(log.timestamp);
-        const wibHour = logWIB.getUTCHours();
-
-        if (hourlyPattern[wibHour]) {
-          if (log.newState === true) {
-            hourlyPattern[wibHour].occupations++;
-            hourlyPattern[wibHour].netChange++;
-          } else {
-            hourlyPattern[wibHour].releases++;
-            hourlyPattern[wibHour].netChange--;
-          }
-        }
-      });
-
-    // Daily pattern for the last 7 days
-    const dailyPattern = {};
-    for (let i = 0; i < 7; i++) {
-      const dayTime = new Date(nowWIB.getTime() - i * 24 * 60 * 60 * 1000);
-      const dayKey = formatWIBDate(dayTime).date;
-
-      dailyPattern[dayKey] = {
-        date: dayKey,
-        dayName: dayTime.toLocaleDateString("id-ID", {
-          timeZone: "Asia/Jakarta",
-          weekday: "long",
-        }),
-        occupations: 0,
-        releases: 0,
-        netChange: 0,
-        totalActivities: 0,
-      };
-    }
-
-    // Analyze daily patterns
-    slotHistory
-      .filter((log) => log.timestamp >= last7Days)
-      .forEach((log) => {
-        const logWIB = convertToWIB(log.timestamp);
-        const dayKey = formatWIBDate(log.timestamp).date;
-
-        if (dailyPattern[dayKey]) {
-          dailyPattern[dayKey].totalActivities++;
-          if (log.newState === true) {
-            dailyPattern[dayKey].occupations++;
-            dailyPattern[dayKey].netChange++;
-          } else {
-            dailyPattern[dayKey].releases++;
-            dailyPattern[dayKey].netChange--;
-          }
-        }
-      });
-
-    // System statistics
     const systemStats = {
       totalDevices: parkingData.size,
-      totalSlots: currentStatus.reduce(
-        (sum, device) => sum + device.totalSlots,
-        0
-      ),
-      totalOccupied: currentStatus.reduce(
-        (sum, device) => sum + device.occupiedSlots,
-        0
-      ),
-      totalAvailable: currentStatus.reduce(
-        (sum, device) => sum + device.availableSlots,
-        0
-      ),
-      overallOccupancyRate: 0,
+      totalSlots,
+      totalOccupied,
+      totalAvailable: totalSlots - totalOccupied,
+      overallOccupancyRate:
+        totalSlots > 0 ? ((totalOccupied / totalSlots) * 100).toFixed(1) : 0,
       totalHistoryRecords: slotHistory.length,
       last24hChanges: slotHistory.filter((log) => log.timestamp >= last24Hours)
-        .length,
-      last7dChanges: slotHistory.filter((log) => log.timestamp >= last7Days)
         .length,
       currentTimeWIB: formatWIBDate(now),
     };
 
-    const totalSlots = systemStats.totalSlots;
-    if (totalSlots > 0) {
-      systemStats.overallOccupancyRate = (
-        (systemStats.totalOccupied / totalSlots) *
-        100
-      ).toFixed(1);
-    }
-
-    // Peak hours analysis
-    const peakHours = Object.values(hourlyPattern)
-      .sort((a, b) => b.occupations + b.releases - (a.occupations + a.releases))
-      .slice(0, 5)
-      .map((hour) => ({
-        hour: hour.hourFormatted,
-        totalActivity: hour.occupations + hour.releases,
-        occupations: hour.occupations,
-        releases: hour.releases,
-      }));
-
     const dashboardData = {
       systemStats,
       currentStatus,
-      slotUsageStats,
       recentChanges,
-      hourlyPattern: Object.values(hourlyPattern).sort(
-        (a, b) => a.hour - b.hour
-      ),
-      dailyPattern: Object.values(dailyPattern).sort(
-        (a, b) => new Date(b.date) - new Date(a.date)
-      ),
-      peakHours,
       timezone: {
         name: "WIB",
         offset: "+07:00",
@@ -550,119 +535,6 @@ app.get("/api/admin/dashboard", (req, res) => {
   }
 });
 
-// New endpoint for hourly analytics specifically
-app.get("/api/admin/hourly-analytics", (req, res) => {
-  try {
-    const { days = 1 } = req.query; // Default to 1 day, can be customized
-    const now = new Date();
-    const nowWIB = getCurrentWIBTime();
-    const hoursBack = parseInt(days) * 24;
-
-    const timeRange = new Date(now.getTime() - hoursBack * 60 * 60 * 1000);
-
-    // Detailed hourly breakdown
-    const hourlyBreakdown = {};
-
-    // Initialize hours
-    for (let i = 0; i < hoursBack; i++) {
-      const hourTime = new Date(nowWIB.getTime() - i * 60 * 60 * 1000);
-      const wibHour = hourTime.getUTCHours();
-      const dateKey = formatWIBDate(hourTime);
-      const hourKey = `${dateKey.date}_${wibHour}`;
-
-      hourlyBreakdown[hourKey] = {
-        date: dateKey.date,
-        hour: wibHour,
-        hourFormatted: `${wibHour.toString().padStart(2, "0")}:00`,
-        fullDateTime: dateKey.formatted,
-        occupations: 0,
-        releases: 0,
-        netChange: 0,
-        totalActivity: 0,
-        averageOccupancy: 0,
-        peakOccupancy: 0,
-      };
-    }
-
-    // Analyze historical data
-    slotHistory
-      .filter((log) => log.timestamp >= timeRange)
-      .forEach((log) => {
-        const logWIB = convertToWIB(log.timestamp);
-        const wibHour = logWIB.getUTCHours();
-        const dateKey = formatWIBDate(log.timestamp);
-        const hourKey = `${dateKey.date}_${wibHour}`;
-
-        if (hourlyBreakdown[hourKey]) {
-          hourlyBreakdown[hourKey].totalActivity++;
-
-          if (log.newState === true) {
-            hourlyBreakdown[hourKey].occupations++;
-            hourlyBreakdown[hourKey].netChange++;
-          } else {
-            hourlyBreakdown[hourKey].releases++;
-            hourlyBreakdown[hourKey].netChange--;
-          }
-        }
-      });
-
-    const hourlyData = Object.values(hourlyBreakdown).sort(
-      (a, b) =>
-        new Date(`${a.date} ${a.hourFormatted}`) -
-        new Date(`${b.date} ${b.hourFormatted}`)
-    );
-
-    res.json({
-      success: true,
-      data: {
-        hourlyBreakdown: hourlyData,
-        summary: {
-          totalHours: hoursBack,
-          totalActivities: hourlyData.reduce(
-            (sum, hour) => sum + hour.totalActivity,
-            0
-          ),
-          totalOccupations: hourlyData.reduce(
-            (sum, hour) => sum + hour.occupations,
-            0
-          ),
-          totalReleases: hourlyData.reduce(
-            (sum, hour) => sum + hour.releases,
-            0
-          ),
-          busiestHour: hourlyData.reduce(
-            (max, hour) =>
-              hour.totalActivity > (max?.totalActivity || 0) ? hour : max,
-            null
-          ),
-          quietestHour: hourlyData.reduce(
-            (min, hour) =>
-              hour.totalActivity < (min?.totalActivity || Infinity)
-                ? hour
-                : min,
-            null
-          ),
-        },
-        timezone: {
-          name: "WIB",
-          offset: "+07:00",
-          description: "Waktu Indonesia Barat (UTC+7)",
-        },
-      },
-      timestamp: now.toISOString(),
-      timestampWIB: formatWIBDate(now),
-    });
-  } catch (error) {
-    console.error("Error fetching hourly analytics:", error);
-    res.status(500).json({
-      success: false,
-      error: "Failed to fetch hourly analytics",
-      details: error.message,
-    });
-  }
-});
-
-// Error handling middleware
 app.use((err, req, res, next) => {
   console.error("Unhandled error:", err);
   res.status(500).json({
@@ -675,7 +547,6 @@ app.use((err, req, res, next) => {
   });
 });
 
-// 404 handler
 app.use((req, res) => {
   res.status(404).json({
     success: false,
@@ -684,22 +555,13 @@ app.use((req, res) => {
   });
 });
 
-// Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   const wibTime = formatWIBDate(new Date());
   console.log(`Simplified Parking Server running on port ${PORT}`);
-  console.log(`Environment: ${process.env.NODE_ENV || "development"}`);
   console.log(`Server started at: ${wibTime.formatted} WIB`);
-  console.log("Available endpoints:");
-  console.log("- POST /api/parking-status (Arduino updates)");
-  console.log("- GET /api/parking-status (Get current status)");
-  console.log("- GET /api/admin/dashboard (Admin analytics)");
-  console.log("- GET /api/admin/hourly-analytics (Detailed hourly data)");
-  console.log("- GET /api/health (Health check)");
 });
 
-// Periodic health check log (every 5 minutes) with WIB time
 setInterval(() => {
   const totalSlots = Array.from(parkingData.values()).reduce(
     (sum, data) => sum + data.totalSlots,
@@ -711,12 +573,12 @@ setInterval(() => {
   );
 
   const wibTime = formatWIBDate(new Date());
-  console.log("=== Parking System Health ===");
+  console.log("\n=== Parking System Health ===");
   console.log(`Time: ${wibTime.formatted} WIB`);
   console.log(`Connected devices: ${parkingData.size}`);
   console.log(`Total parking slots: ${totalSlots}`);
   console.log(`Currently occupied: ${occupiedSlots}`);
   console.log(`History records: ${slotHistory.length}`);
   console.log(`Server uptime: ${Math.floor(process.uptime())} seconds`);
-  console.log("============================");
-}, 5 * 60 * 1000);
+  console.log("============================\n");
+}, 10 * 60 * 1000);
