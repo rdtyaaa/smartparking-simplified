@@ -35,7 +35,7 @@ const JWT_SECRET =
 // Default admin user (remove this in production and use proper registration)
 const defaultAdmin = {
   email: "admin@parking.com",
-  password: await bcrypt.hash("admin123", 10), // Generate hash langsung
+  password: "$2a$10$881xLk38aaxjYNMBkhm9BOAwk3q5mmk89VSUWAkpBzj1IxyVMXlPW",
   name: "Admin",
   role: "admin",
   createdAt: new Date(),
